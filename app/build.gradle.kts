@@ -4,7 +4,28 @@ plugins {
     id("org.jetbrains.kotlin.kapt")
 }
 
+// CI injects these Gradle properties from GitHub Actions secrets.
+// No signing password or keystore is stored in the repository.
+val ciBuildNumber = providers.gradleProperty("buildVersionCode").orNull?.toInt()
+val releaseStoreFile = providers.gradleProperty("signingStoreFile").orNull
+val releaseStorePassword = providers.gradleProperty("signingStorePassword").orNull
+val releaseKeyAlias = providers.gradleProperty("signingKeyAlias").orNull
+val releaseKeyPassword = providers.gradleProperty("signingKeyPassword").orNull
+val hasReleaseSigning = listOf(releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword)
+    .all { !it.isNullOrBlank() }
+
 android {
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(requireNotNull(releaseStoreFile))
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     namespace = "com.novelreader.app"
     compileSdk = 34
 
@@ -12,8 +33,8 @@ android {
         applicationId = "com.novelreader.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = ciBuildNumber ?: 1
+        versionName = ciBuildNumber?.let { "1.0.$it" } ?: "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -24,7 +45,8 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            // Never sign published APKs with the Android debug certificate.
+            signingConfig = signingConfigs.findByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

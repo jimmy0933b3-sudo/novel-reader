@@ -10,3 +10,9 @@
 *.apk
 *.aab
 /app/build
+
+# Release signing material must never be committed
+*.jks
+*.keystore
+*.p12
+**/signing.properties

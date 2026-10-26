@@ -1,46 +1,213 @@
-name: Build Android APK
+name: Build and Publish Signed APK
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [main]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: novel-reader-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    name: Build APK
-    runs-on: ubuntu-latest
-
+    name: Test and Build APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
+          distribution: temurin
           java-version: '17'
-          distribution: 'temurin'
-          cache: gradle
 
-      - name: Make gradlew executable
-        run: chmod +x gradlew
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
-      - name: Run Unit Tests
-        run: ./gradlew testDebugUnitTest --no-daemon
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
 
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon
+      - name: Install Android 34 SDK
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Upload Debug APK
+      - name: Run unit tests and build Debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug "-PbuildVersionCode=${GITHUB_RUN_NUMBER}"
+
+      - name: Upload Debug APK for PR
+        if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: NovelReader-Debug-APK
           path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Upload Test Reports
+      - name: Validate fixed GitHub Actions signing key
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing GitHub Actions secret: ${name}. The previous Release is preserved."
+              exit 1
+            fi
+          done
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | tr -d '\r\n\t ' | base64 --decode > "$RUNNER_TEMP/novel-reader-release.jks"
+          test -s "$RUNNER_TEMP/novel-reader-release.jks"
+          keytool -list -keystore "$RUNNER_TEMP/novel-reader-release.jks" \
+            -storepass:env KEYSTORE_PASSWORD -alias "$KEY_ALIAS" >/dev/null
+
+      - name: Build and verify signed Release APK
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          ORG_GRADLE_PROJECT_signingStoreFile: ${{ runner.temp }}/novel-reader-release.jks
+          ORG_GRADLE_PROJECT_signingStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingKeyAlias: ${{ secrets.KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_signingKeyPassword: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon :app:assembleRelease "-PbuildVersionCode=${GITHUB_RUN_NUMBER}"
+          apk="app/build/outputs/apk/release/app-release.apk"
+          test -s "$apk"
+          apksigner="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          "$apksigner" verify --verbose "$apk"
+          cert_sha="$("$apksigner" verify --print-certs "$apk" |
+            sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1)"
+          test -n "$cert_sha"
+          mkdir -p release
+          cp "$apk" release/NovelReader-latest.apk
+          printf 'Signer SHA256: %s\nversionCode: %s\ncommit: %s\n' \
+            "$cert_sha" "$GITHUB_RUN_NUMBER" "$GITHUB_SHA" > release/SIGNING-INFO.txt
+          echo "### Verified signed Release APK" >> "$GITHUB_STEP_SUMMARY"
+          echo "Version code: \`$GITHUB_RUN_NUMBER\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Signing certificate SHA-256: \`$cert_sha\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload signed APK
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NovelReader-signed-APK
+          path: |
+            release/NovelReader-latest.apk
+            release/SIGNING-INFO.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload test reports on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-reports
+          name: NovelReader-test-reports
           path: app/build/reports/tests/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    name: Publish Latest Release
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Download verified APK
+        uses: actions/download-artifact@v4
+        with:
+          name: NovelReader-signed-APK
+          path: release
+
+      - name: Publish newest Release and remove older Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test -s release/NovelReader-latest.apk
+          test -s release/SIGNING-INFO.txt
+
+          # Skip an outdated run. Never replace a newer build with an older commit.
+          head_sha="$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)"
+          if [[ "$head_sha" != "$GITHUB_SHA" ]]; then
+            echo "A newer main commit exists; skipping this obsolete release."
+            exit 0
+          fi
+
+          # Prevent accidental signing-key rotation from breaking APK updates.
+          current_sha="$(sed -n 's/^Signer SHA256: //p' release/SIGNING-INFO.txt | head -n 1)"
+          test -n "$current_sha"
+          previous_sha="$(gh api "repos/$GH_REPO/releases/latest" --jq '.body' 2>/dev/null |
+            sed -n 's/^Signer SHA256: //p' | head -n 1 || true)"
+          if [[ -n "$previous_sha" && "$previous_sha" != "$current_sha" ]]; then
+            echo "::error::Signing certificate differs from the previous Release. Keeping the old Release."
+            exit 1
+          fi
+
+          tag="v1.0.${GITHUB_RUN_NUMBER}"
+          cp release/SIGNING-INFO.txt release/release-notes.txt
+          published=false
+          for attempt in 1 2 3; do
+            if gh release view "$tag" >/dev/null 2>&1; then
+              if gh release upload "$tag" release/NovelReader-latest.apk release/SIGNING-INFO.txt --clobber &&
+                gh release edit "$tag" --latest --title "Novel Reader ${tag} | 最新版 APK" \
+                  --notes-file release/release-notes.txt; then
+                published=true
+                break
+              fi
+            elif gh release create "$tag" release/NovelReader-latest.apk release/SIGNING-INFO.txt \
+              --target "$GITHUB_SHA" --latest \
+              --title "Novel Reader ${tag} | 最新版 APK" \
+              --notes-file release/release-notes.txt; then
+              published=true
+              break
+            fi
+            sleep "$((attempt * 5))"
+          done
+          if [[ "$published" != true ]]; then
+            echo "::error::New Release failed; preserving all older Releases."
+            exit 1
+          fi
+
+          # Only clean up once the replacement release and both assets are verified.
+          assets="$(gh release view "$tag" --json assets --jq '.assets[] | select(.size > 0) | .name')"
+          grep -Fxq "NovelReader-latest.apk" <<< "$assets"
+          grep -Fxq "SIGNING-INFO.txt" <<< "$assets"
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name' |
+            while IFS= read -r old_tag; do
+              [[ -z "$old_tag" || "$old_tag" == "$tag" ]] && continue
+              gh release delete "$old_tag" --yes --cleanup-tag
+            done
+          echo "Release: https://github.com/$GH_REPO/releases/latest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep only newest signed build artifact
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const all = await github.paginate(github.rest.actions.listArtifactsForRepo,
+              { owner, repo, per_page: 100 });
+            const signed = all.filter(a => a.name === 'NovelReader-signed-APK' && !a.expired)
+              .sort((a, b) => b.id - a.id);
+            for (const artifact of signed.slice(1)) {
+              await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: artifact.id });
+            }
