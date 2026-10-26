@@ -66,7 +66,7 @@
 | `KEY_ALIAS` | 簽章用私鑰的 alias |
 | `KEY_PASSWORD` | 私鑰密碼 |
 
-Linux/macOS 範例：`base64 < release.jks | tr -d '\\n'`，將結果設為 `KEYSTORE_BASE64`；其他密碼與 alias 分別填入相對應的 Secret。**切勿將 keystore、密碼或 Base64 內容提交到 Git。**
+Linux/macOS 範例：`base64 < release.jks | tr -d '\n'`，將結果設為 `KEYSTORE_BASE64`；其他密碼與 alias 分別填入相對應的 Secret。**切勿將 keystore、密碼或 Base64 內容提交到 Git。**
 
 只要在 `main` 成功完成 CI，就能透過固定網址取得最新正式版：
 `https://github.com/jimmy0933b3-sudo/novel-reader/releases/latest`
