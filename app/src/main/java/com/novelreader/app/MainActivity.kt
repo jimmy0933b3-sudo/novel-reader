@@ -80,6 +80,10 @@ class MainActivity : ComponentActivity() {
                                 repository.startDownloadAllChapters(novelId)
                                 Toast.makeText(this@MainActivity, "已在背景開始整部下載！", Toast.LENGTH_SHORT).show()
                             },
+                            onRedownloadAll = {
+                                repository.startDownloadAllChapters(novelId, forceRefresh = true)
+                                Toast.makeText(this@MainActivity, "開始重新抓取全書；失敗時保留原有內容", Toast.LENGTH_LONG).show()
+                            },
                             onSyncLatestChapters = { callback ->
                                 lifecycleScope.launch {
                                     Toast.makeText(this@MainActivity, "正在檢查並同步最新章節...", Toast.LENGTH_SHORT).show()

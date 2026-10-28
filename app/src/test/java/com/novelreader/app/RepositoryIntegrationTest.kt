@@ -10,6 +10,9 @@ import com.novelreader.app.data.local.NovelEntity
 import com.novelreader.app.data.repository.NovelRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.withContext
 import org.junit.After
 import org.junit.Assert.*
@@ -100,4 +103,86 @@ class RepositoryIntegrationTest {
         assertTrue(saved?.isDownloaded == true)
         assertEquals("Hello World", saved?.content)
     }
+    @Test
+    fun forceRefreshReplacesOnlyTheRequestedChapter() = runBlocking {
+        val db = AppDatabase.getDatabase(context)
+        val id = "refresh_book"
+        val url = mockWebServer.url("/chapter/1").toString()
+        withContext(Dispatchers.IO) {
+            db.novelDao().insertNovel(
+                NovelEntity(id, "Book", "Author", "", "", url, totalChapters = 1)
+            )
+            db.chapterDao().insertChapters(listOf(
+                ChapterEntity(id, 0, "chapter-1", "第1章", url, "舊版不正確內容", true)
+            ))
+        }
+
+        mockWebServer.enqueue(
+            MockResponse().setResponseCode(200)
+                .setBody("<html><body><h1>第1章</h1><div id='content'><p>網頁的正確新內容</p></div></body></html>")
+        )
+        val result = repository.downloadSingleChapter(id, 0, forceRefresh = true)
+        assertTrue(result.exceptionOrNull()?.toString(), result.isSuccess)
+        assertEquals("網頁的正確新內容", db.chapterDao().getChapterById(id, "chapter-1")?.content)
+    }
+
+    @Test
+    fun wrongChapterPageNeverOverwritesOfflineContent() = runBlocking {
+        val db = AppDatabase.getDatabase(context)
+        val id = "mismatched_book"
+        val url = mockWebServer.url("/chapter/1").toString()
+        withContext(Dispatchers.IO) {
+            db.novelDao().insertNovel(
+                NovelEntity(id, "Book", "Author", "", "", url, totalChapters = 1)
+            )
+            db.chapterDao().insertChapters(listOf(
+                ChapterEntity(id, 0, "chapter-1", "第1章", url, "已儲存文字", true)
+            ))
+        }
+        mockWebServer.enqueue(
+            MockResponse().setResponseCode(200)
+                .setBody("<html><body><h1>第2章</h1><div id='content'>抓到別章的內容</div></body></html>")
+        )
+        val result = repository.downloadSingleChapter(id, 0, forceRefresh = true)
+        assertTrue(result.isFailure)
+        assertEquals("已儲存文字", db.chapterDao().getChapterById(id, "chapter-1")?.content)
+    }
+
+    @Test
+    fun catalogReorderDuringDownloadDoesNotWriteToTheWrongChapter() = runBlocking {
+        val db = AppDatabase.getDatabase(context)
+        val id = "reorder_book"
+        val url = mockWebServer.url("/chapter/old").toString()
+        withContext(Dispatchers.IO) {
+            db.novelDao().insertNovel(
+                NovelEntity(id, "Book", "Author", "", "", url, totalChapters = 1)
+            )
+            db.chapterDao().insertChapters(listOf(
+                ChapterEntity(id, 0, "old-id", "第1章", url)
+            ))
+        }
+        mockWebServer.enqueue(
+            MockResponse().setResponseCode(200)
+                .setBodyDelay(800, TimeUnit.MILLISECONDS)
+                .setBody("<html><body><h1>第1章</h1><div id='content'>舊章節正文</div></body></html>")
+        )
+        val task = async(Dispatchers.IO) { repository.downloadChapterById(id, "old-id") }
+        val request = withContext(Dispatchers.IO) {
+            mockWebServer.takeRequest(3, TimeUnit.SECONDS)
+        }
+        assertNotNull("Chapter request never reached the server", request)
+
+        withContext(Dispatchers.IO) {
+            val old = db.chapterDao().getChapterById(id, "old-id")!!
+            db.chapterDao().updateChapters(listOf(old.copy(chapterIndex = 1)))
+            db.chapterDao().insertChapters(listOf(
+                ChapterEntity(id, 0, "new-id", "新插入章", mockWebServer.url("/chapter/new").toString())
+            ))
+        }
+        val result = task.await()
+        assertTrue(result.exceptionOrNull()?.toString(), result.isSuccess)
+        assertEquals("舊章節正文", db.chapterDao().getChapterById(id, "old-id")?.content)
+        assertNull(db.chapterDao().getChapterById(id, "new-id")?.content)
+    }
+
 }

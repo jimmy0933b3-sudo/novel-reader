@@ -41,14 +41,33 @@ fun NovelDetailScreen(
     onBack: () -> Unit,
     onChapterClick: (Int) -> Unit,
     onDownloadAll: () -> Unit,
+    onRedownloadAll: () -> Unit,
     onSyncLatestChapters: (() -> Unit) -> Unit,
     onDownloadSingleChapter: (Int, () -> Unit) -> Unit
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("novel_prefs", android.content.Context.MODE_PRIVATE) }
     var isSyncing by remember { mutableStateOf(false) }
+    var showRedownloadConfirmation by remember { mutableStateOf(false) }
     var downloadingChapterIndices by remember { mutableStateOf(setOf<Int>()) }
     var isReversed by remember { mutableStateOf(false) }
+
+    if (showRedownloadConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showRedownloadConfirmation = false },
+            title = { Text("重新下載全部章節？") },
+            text = { Text("會逐章重新抓取網頁正文；某章抓取失敗時，原本已下載的文字不會被清除。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showRedownloadConfirmation = false
+                    onRedownloadAll()
+                }) { Text("開始重新下載") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRedownloadConfirmation = false }) { Text("取消") }
+            }
+        )
+    }
 
     val workManager = androidx.work.WorkManager.getInstance(context)
     val novelId = novel?.id ?: ""
@@ -282,6 +301,11 @@ fun NovelDetailScreen(
                                     Text("下載全部")
                                 }
                             }
+                        }
+                        TextButton(onClick = { showRedownloadConfirmation = true }) {
+                            Icon(Icons.Default.Sync, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("重新抓取全書（修復錯誤章節）")
                         }
                         Spacer(modifier = Modifier.height(8.dp))
                     }

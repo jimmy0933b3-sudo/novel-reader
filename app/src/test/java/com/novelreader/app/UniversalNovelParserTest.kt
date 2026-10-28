@@ -59,4 +59,45 @@ class UniversalNovelParserTest {
         assertTrue(content.contains("這是第二段話。"))
         assertFalse(content.contains("var ad = 1;"))
     }
+    @Test
+    fun keepsMixedTextAndBreaksInOriginalOrder() {
+        val html = """
+            <html><body>
+              <div class="content"><a href="/nav">章節目錄</a></div>
+              <div id="chapter-content">
+                前言文字<br/>第一行<p>第二段<span>內容</span></p>
+                <div>第三段<br>接續的文字</div>
+                <div class="ad">廣告不能混進來</div>
+                <p>第四段</p>
+              </div>
+            </body></html>
+        """.trimIndent()
+        val content = parser.parseChapterContent(html)
+        assertEquals(
+            listOf("前言文字", "第一行", "第二段內容", "第三段", "接續的文字", "第四段"),
+            content.split("\n\n")
+        )
+        assertFalse(content.contains("章節目錄"))
+        assertFalse(content.contains("廣告不能混進來"))
+    }
+
+    @Test
+    fun rejectsWrongChapterHeading() {
+        val html = "<html><body><h1>第12章 不同內容</h1><div id='content'><p>正文內容</p></div></body></html>"
+        val error = assertThrows(IllegalStateException::class.java) {
+            parser.parseChapterContent(html, "第十一章 原章節")
+        }
+        assertTrue(error.message.orEmpty().contains("章節不符"))
+    }
+
+    @Test
+    fun refusesLoginOrMenuInsteadOfChapter() {
+        assertThrows(IllegalStateException::class.java) {
+            parser.parseChapterContent("<html><head><title>Just a moment...</title></head><body><p>驗證中</p></body></html>")
+        }
+        assertThrows(IllegalStateException::class.java) {
+            parser.parseChapterContent("<html><body><p>首頁 / 章節目錄</p></body></html>")
+        }
+    }
+
 }

@@ -2,6 +2,9 @@ package com.novelreader.app.data.parser
 
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import org.jsoup.nodes.Node
+import org.jsoup.nodes.TextNode
 
 data class ParsedNovelDetail(
     val title: String,
@@ -169,31 +172,97 @@ class UniversalNovelParser {
     }
 
     /**
-     * 從章節內文頁面 HTML 擷取小說純文字內容
+     * Read only the real chapter body, not login pages or site navigation.
+     * Preserve text outside <p> and line breaks expressed with <br>.
      */
-    fun parseChapterContent(html: String): String {
-        val doc: Document = Jsoup.parse(html)
-
-        // 移除常見的廣告、腳本、導航干擾標籤
-        doc.select("script, style, iframe, header, footer, nav, .ad, .advertisement, .share").remove()
-
-        // 優先嘗試常見正文選擇器 (czbooks 通常使用 #content, .content, .chapter-content, #chapter-content)
-        val contentElement = doc.selectFirst("#content, .content, #chapter-content, .chapter-content, .novel-content, #read-content")
-            ?: doc.selectFirst("article")
-            ?: doc.body()
-
-        // 將 <p> 或 <br> 替換保留換行，其餘轉成純文字
-        val paragraphs = contentElement.select("p").map { it.text().trim() }.filter { it.isNotBlank() }
-        return if (paragraphs.isNotEmpty()) {
-            paragraphs.joinToString("\n\n")
-        } else {
-            // 沒有 <p> 標籤時直接取 text
-            contentElement.wholeText()
-                .lines()
-                .map { it.trim() }
-                .filter { it.isNotBlank() }
-                .joinToString("\n\n")
+    fun parseChapterContent(html: String, expectedTitle: String? = null): String {
+        val doc = Jsoup.parse(html)
+        val pageTitle = doc.title().trim()
+        val pageText = doc.body()?.text().orEmpty()
+        val errorPattern = Regex(
+            "(?i)(just a moment|access denied|attention required|404\\s*not found|captcha|cf-challenge|enable javascript|登入後閱讀|請先登入|找不到這個頁面)"
+        )
+        if (errorPattern.containsMatchIn(pageTitle) ||
+            (pageText.length < 500 && errorPattern.containsMatchIn(pageText))) {
+            throw IllegalStateException("來源網站回傳登入、驗證或錯誤頁，未儲存為正文")
         }
+
+        if (!expectedTitle.isNullOrBlank()) {
+            val expectedNo = chapterSequenceNumber(expectedTitle)
+            val heading = doc.selectFirst(
+                ".chapter-title, #chapter-title, .read-title, .article-title, h1"
+            )?.text().orEmpty()
+            val actualNo = chapterSequenceNumber(heading)
+            if (expectedNo != null && actualNo != null && expectedNo != actualNo) {
+                throw IllegalStateException("目錄章節與網頁章節不符：$expectedTitle / $heading")
+            }
+        }
+
+        // Prefer actual reading containers to the generic .content wrapper.
+        val selectors = listOf(
+            "#chapter-content", "#read-content", ".chapter-content",
+            ".read-content", ".novel-content", "#content", "#nr1",
+            ".article-content", ".txtnav", "article", ".content"
+        )
+        val selected = selectors.asSequence()
+            .mapNotNull { selector ->
+                doc.select(selector).firstOrNull { el ->
+                    val textSize = el.text().trim().length
+                    val linkSize = el.select("a").text().length
+                    textSize >= 3 && (linkSize == 0 || linkSize * 2 < textSize)
+                }
+            }.firstOrNull()
+            ?: doc.body()?.takeIf { body ->
+                body.text().length >= 200 &&
+                    body.select("a").text().length * 3 < body.text().length
+            }
+            ?: throw IllegalStateException("找不到可信的小說正文，未將導覽頁存成章節")
+
+        val content = selected.clone()
+        content.select(
+            "script, style, noscript, iframe, nav, header, footer, form, button, " +
+                ".ad, .ads, .advertisement, .share, .related, .recommend, " +
+                ".chapter-list, #chapter-list, .pagination, .page-nav, " +
+                ".next-prev, .booklist, [hidden], [style*=display:none]"
+        ).remove()
+
+        val result = StringBuilder()
+        fun walk(node: Node) {
+            when (node) {
+                is TextNode -> result.append(node.wholeText)
+                is Element -> {
+                    val tag = node.normalName()
+                    if (tag == "br" || tag == "hr") {
+                        result.append('\n')
+                        return
+                    }
+                    val block = tag in setOf("p", "div", "section", "article", "li", "h1", "h2", "h3")
+                    if (block && result.isNotEmpty()) result.append('\n')
+                    node.childNodes().forEach { walk(it) }
+                    if (block) result.append('\n')
+                }
+                else -> node.childNodes().forEach { walk(it) }
+            }
+        }
+        content.childNodes().forEach { walk(it) }
+        val lines = result.toString()
+            .replace('\u00a0', ' ')
+            .lines()
+            .map { it.trim().replace(Regex("[ \\t]+"), " ") }
+            .filter { it.isNotBlank() }
+        val extracted = lines.joinToString("\n\n")
+        if (extracted.isBlank()) {
+            throw IllegalStateException("章節正文為空，未覆蓋離線內容")
+        }
+        return extracted
+    }
+
+    private fun chapterSequenceNumber(title: String): Long? {
+        val number = Regex("(?i)第\\s*([0-9]+|[零一二三四五六七八九十百千萬兩]+)\\s*[章話節回]")
+            .find(title)?.groupValues?.get(1)
+        if (number != null) return number.toLongOrNull() ?: parseChineseNumber(number)
+        return Regex("(?i)\\bchapter\\s*(\\d+)\\b")
+            .find(title)?.groupValues?.get(1)?.toLongOrNull()
     }
 
     /**

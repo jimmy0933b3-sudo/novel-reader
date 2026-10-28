@@ -44,14 +44,18 @@ interface ChapterDao {
     @Query("SELECT * FROM chapters WHERE novelId = :novelId AND chapterIndex = :index")
     suspend fun getChapterByIndex(novelId: String, index: Int): ChapterEntity?
 
+    @Query("SELECT * FROM chapters WHERE novelId = :novelId AND chapterId = :chapterId LIMIT 1")
+    suspend fun getChapterById(novelId: String, chapterId: String): ChapterEntity?
+
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertChapters(chapters: List<ChapterEntity>)
 
     @Update
     suspend fun updateChapters(chapters: List<ChapterEntity>)
 
-    @Query("UPDATE chapters SET content = :content, isDownloaded = 1 WHERE novelId = :novelId AND chapterIndex = :index")
-    suspend fun saveChapterContent(novelId: String, index: Int, content: String)
+    // The chapter index can change while catalog synchronization is running.
+    @Query("UPDATE chapters SET content = :content, isDownloaded = 1 WHERE novelId = :novelId AND chapterId = :chapterId AND url = :url")
+    suspend fun saveChapterContent(novelId: String, chapterId: String, url: String, content: String): Int
 
     @Query("SELECT COUNT(*) FROM chapters WHERE novelId = :novelId AND isDownloaded = 1")
     fun getDownloadedCountFlow(novelId: String): Flow<Int>

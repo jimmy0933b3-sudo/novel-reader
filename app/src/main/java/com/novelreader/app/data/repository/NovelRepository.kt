@@ -13,6 +13,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
@@ -43,56 +44,56 @@ class NovelRepository(private val context: Context) {
     }
 
     private val repositoryScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val activeCalls = java.util.concurrent.ConcurrentHashMap<Pair<String, Int>, okhttp3.Call>()
-    private val inFlightDownloads = java.util.concurrent.ConcurrentHashMap<Pair<String, Int>, Deferred<Result<Unit>>>()
+    // A chapter ID is stable across catalog reorderings, unlike chapterIndex.
+    private val activeCalls = java.util.concurrent.ConcurrentHashMap<Pair<String, String>, okhttp3.Call>()
+    private val inFlightDownloads = java.util.concurrent.ConcurrentHashMap<Pair<String, String>, Deferred<Result<Unit>>>()
 
-    // Tracks the number of active waiters (e.g., Reader + Worker)
-    private val inFlightWaiters = java.util.concurrent.ConcurrentHashMap<Pair<String, Int>, Int>()
-
-    /**
-     * 下載單一章節（提供即時閱讀、預載與背景整部下載共用，同一章節避免重複請求）
-     */
-    suspend fun downloadSingleChapter(novelId: String, chapterIndex: Int): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun downloadSingleChapter(
+        novelId: String,
+        chapterIndex: Int,
+        forceRefresh: Boolean = false
+    ): Result<Unit> {
         val chapter = chapterDao.getChapterByIndex(novelId, chapterIndex)
-            ?: return@withContext Result.failure(IllegalArgumentException("找不到該章節"))
+            ?: return Result.failure(IllegalArgumentException("找不到該章節"))
+        return downloadChapterById(novelId, chapter.chapterId, forceRefresh)
+    }
 
-        if (chapter.isDownloaded && !chapter.content.isNullOrBlank()) {
+    /** Always download/write the exact chapter, regardless of later index changes. */
+    suspend fun downloadChapterById(
+        novelId: String,
+        chapterId: String,
+        forceRefresh: Boolean = false
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        val chapter = chapterDao.getChapterById(novelId, chapterId)
+            ?: return@withContext Result.failure(IllegalArgumentException("找不到該章節"))
+        if (!forceRefresh && chapter.isDownloaded && !chapter.content.isNullOrBlank()) {
             return@withContext Result.success(Unit)
         }
 
-        val key = Pair(novelId, chapterIndex)
-
+        val key = novelId to chapterId
         val deferred = synchronized(inFlightDownloads) {
-            inFlightWaiters[key] = (inFlightWaiters[key] ?: 0) + 1
             inFlightDownloads.getOrPut(key) {
-                repositoryScope.async {
+                repositoryScope.async(start = CoroutineStart.LAZY) {
                     try {
                         fetchAndSaveChapter(novelId, chapter)
                     } finally {
-                        inFlightDownloads.remove(key)
-                        inFlightWaiters.remove(key)
-                        activeCalls.remove(key)?.cancel()
+                        synchronized(inFlightDownloads) {
+                            inFlightDownloads.remove(key)
+                        }
+                        activeCalls.remove(key)
                     }
                 }
             }
         }
-
+        // Put a lazy Deferred into the map before starting it. Otherwise the
+        // coroutine can complete and remove itself before insertion, caching
+        // a finished result and breaking forced refresh.
+        deferred.start()
+        // A cancelled reader should not cancel a background worker awaiting
+        // the same download. Network calls use a bounded timeout.
         try {
             deferred.await()
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            val waiters = synchronized(inFlightDownloads) {
-                val count = (inFlightWaiters[key] ?: 1) - 1
-                if (count <= 0) {
-                    inFlightWaiters.remove(key)
-                } else {
-                    inFlightWaiters[key] = count
-                }
-                count
-            }
-            if (waiters <= 0) {
-                deferred.cancel()
-                activeCalls.remove(key)?.cancel()
-            }
+        } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Result.failure(e)
@@ -101,77 +102,69 @@ class NovelRepository(private val context: Context) {
 
     private suspend fun fetchAndSaveChapter(novelId: String, chapter: ChapterEntity): Result<Unit> {
         var lastException: Throwable? = null
-        val maxAttempts = 3
+        val key = novelId to chapter.chapterId
 
-        for (attempt in 1..maxAttempts) {
+        for (attempt in 1..3) {
             try {
                 val cookie = try {
                     android.webkit.CookieManager.getInstance().getCookie(chapter.url)
                 } catch (e: Exception) {
                     null
                 }
-
                 val requestBuilder = Request.Builder()
                     .url(chapter.url)
                     .header("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36")
                     .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
                     .header("Accept-Language", "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7")
-
-                if (!cookie.isNullOrBlank()) {
-                    requestBuilder.header("Cookie", cookie)
-                }
+                if (!cookie.isNullOrBlank()) requestBuilder.header("Cookie", cookie)
 
                 val call = httpClient.newCall(requestBuilder.build())
-                activeCalls[Pair(novelId, chapter.chapterIndex)] = call
+                activeCalls[key] = call
                 call.execute().use { response ->
-                    val statusCode = response.code
-
                     if (!response.isSuccessful) {
-                        val msg = when (statusCode) {
+                        val msg = when (response.code) {
                             403 -> "HTTP 403: 存取被拒絕（可能有機器人防護）"
                             404 -> "HTTP 404: 找不到該章節網頁"
-                            else -> "HTTP 狀態碼 $statusCode"
+                            else -> "HTTP 狀態碼 " + response.code
                         }
                         return Result.failure(IllegalStateException(msg))
                     }
 
+                    // A login/home redirect is not the requested chapter.
+                    val expected = chapter.url.toHttpUrl()
+                    val actual = response.request.url
+                    if (!expected.encodedPath.trimEnd('/').equals(actual.encodedPath.trimEnd('/'), true)) {
+                        return Result.failure(
+                            IllegalStateException("網頁轉址到其他路徑：" + actual + "，保留原本離線內容")
+                        )
+                    }
                     val html = response.body?.string().orEmpty()
-
                     if (html.isBlank()) {
                         return Result.failure(IllegalStateException("網頁內容空白"))
                     }
 
-                    if (html.contains("Enable JavaScript and cookies to continue") ||
-                        html.contains("cf-challenge") ||
-                        html.contains("captcha") ||
-                        html.contains("請開啟 JavaScript")
-                    ) {
-                        return Result.failure(IllegalStateException("觸發防護驗證頁，無法直接擷取"))
+                    val content = parser.parseChapterContent(html, chapter.title)
+                    // Compare both stable ID and URL to protect against a
+                    // concurrent catalog update or a deleted book.
+                    val updated = chapterDao.saveChapterContent(
+                        novelId, chapter.chapterId, chapter.url, content
+                    )
+                    if (updated != 1) {
+                        return Result.failure(IllegalStateException("章節在下載期間已變更，未覆蓋其他章節"))
                     }
-
-                    val content = parser.parseChapterContent(html)
-                    if (content.isBlank()) {
-                        return Result.failure(IllegalStateException("章節正文解析失敗或內容空白"))
-                    }
-
-                    // 驗證成功，存入資料庫
-                    chapterDao.saveChapterContent(novelId, chapter.chapterIndex, content)
                     novelDao.refreshDownloadedCount(novelId)
                     return Result.success(Unit)
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                if (e is kotlinx.coroutines.CancellationException) {
-                    throw e // Ensure true cancellation is propagated
-                }
-                // Note: SocketTimeoutException is a subclass of InterruptedIOException
-                // But we don't want to cancel the coroutine for just a network timeout
                 lastException = e
-                if (attempt < maxAttempts) {
-                    delay(500L * attempt)
-                }
+                if (attempt < 3) delay(500L * attempt)
+            } finally {
+                activeCalls.remove(key)
             }
         }
-        return Result.failure(lastException ?: IllegalStateException("下載該章節失敗"))
+        return Result.failure(lastException ?: IllegalStateException("章節下載失敗"))
     }
 
     /**
@@ -394,9 +387,9 @@ class NovelRepository(private val context: Context) {
     /**
      * 發動背景整部下載
      */
-    fun startDownloadAllChapters(novelId: String) {
+    fun startDownloadAllChapters(novelId: String, forceRefresh: Boolean = false) {
         val workRequest = OneTimeWorkRequestBuilder<NovelDownloadWorker>()
-            .setInputData(workDataOf("NOVEL_ID" to novelId))
+            .setInputData(workDataOf("NOVEL_ID" to novelId, "FORCE_REFRESH" to forceRefresh))
             .addTag("DOWNLOAD_$novelId")
             .setConstraints(
                 Constraints.Builder()
@@ -414,7 +407,7 @@ class NovelRepository(private val context: Context) {
         // Use KEEP so we don't start duplicate jobs for the same novel.
         workManager.enqueueUniqueWork(
             "DOWNLOAD_$novelId",
-            ExistingWorkPolicy.KEEP,
+            if (forceRefresh) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP,
             workRequest
         )
     }

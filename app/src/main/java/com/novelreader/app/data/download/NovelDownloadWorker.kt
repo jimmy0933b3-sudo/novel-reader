@@ -91,6 +91,7 @@ class NovelDownloadWorker(
 
         override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val novelId = inputData.getString("NOVEL_ID") ?: return@withContext Result.failure()
+        val forceRefresh = inputData.getBoolean("FORCE_REFRESH", false)
 
         // Get PowerManager WakeLock
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
@@ -134,7 +135,8 @@ class NovelDownloadWorker(
                     return@withContext Result.retry()
                 }
 
-                val pendingChapters = db.chapterDao().getPendingDownloadChapters(novelId)
+                val pendingChapters = if (forceRefresh) db.chapterDao().getChapters(novelId)
+                    else db.chapterDao().getPendingDownloadChapters(novelId)
                 val total = db.chapterDao().getChapters(novelId).size
                 val pendingCount = pendingChapters.size
 
@@ -148,7 +150,7 @@ class NovelDownloadWorker(
                         return@withContext Result.retry()
                     }
 
-                    val currentStep = total - pendingCount + index + 1
+                    val currentStep = if (forceRefresh) index + 1 else total - pendingCount + index + 1
                     val progressText = "[$currentStep/$total] $novelTitle - ${chapter.title}"
 
                     try {
@@ -175,7 +177,7 @@ class NovelDownloadWorker(
                     }
 
                     val downloadResult = if (repository != null) {
-                        repository.downloadSingleChapter(novelId, chapter.chapterIndex)
+                        repository.downloadChapterById(novelId, chapter.chapterId, forceRefresh)
                     } else {
                         kotlin.Result.failure(IllegalStateException("NovelRepository 未初始化"))
                     }

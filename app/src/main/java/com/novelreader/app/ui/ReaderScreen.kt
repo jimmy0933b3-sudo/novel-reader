@@ -53,6 +53,7 @@ fun ReaderScreen(
     var isLoadingChapter by remember { mutableStateOf(false) }
     var chapterError by remember { mutableStateOf<String?>(null) }
     var retryTrigger by remember { mutableStateOf(0) }
+    var refreshChapterIndex by remember { mutableStateOf<Int?>(null) }
 
     var isFirstLaunch by remember { mutableStateOf(true) }
     var isReadyToRecord by remember { mutableStateOf(false) }
@@ -92,9 +93,11 @@ fun ReaderScreen(
     // 處理當前章節載入、即時下載、閱讀進度更新與背景預載後續 2 章
     LaunchedEffect(novelId, chapterIndex, retryTrigger) {
         val targetIndex = chapterIndex
+        val forceRefresh = refreshChapterIndex == targetIndex
+        refreshChapterIndex = null
         val currentChapter = repository.getChapter(novelId, targetIndex)
         if (currentChapter != null) {
-            if (currentChapter.isDownloaded && !currentChapter.content.isNullOrBlank()) {
+            if (!forceRefresh && currentChapter.isDownloaded && !currentChapter.content.isNullOrBlank()) {
                 isLoadingChapter = false
                 chapterError = null
                 if (chapterIndex == targetIndex) {
@@ -105,7 +108,7 @@ fun ReaderScreen(
                 isLoadingChapter = true
                 chapterError = null
 
-                val result = repository.downloadSingleChapter(novelId, targetIndex)
+                val result = repository.downloadSingleChapter(novelId, targetIndex, forceRefresh)
                 if (result.isSuccess) {
                     isLoadingChapter = false
                     chapterError = null
@@ -241,14 +244,22 @@ fun ReaderScreen(
                 },
                 actions = {
                     // 單章下載／重試按鈕（若本章未下載）
-                    if (chapter != null && !chapter.isDownloaded) {
+                    if (chapter != null) {
                         IconButton(
-                            onClick = { retryTrigger++ }
+                            onClick = {
+                                refreshChapterIndex = chapterIndex
+                                retryTrigger++
+                            },
+                            enabled = !isLoadingChapter
                         ) {
                             if (isLoadingChapter) {
                                 CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = iconTint)
                             } else {
-                                Icon(Icons.Default.Download, contentDescription = "下載本章", tint = iconTint)
+                                Icon(
+                                    if (chapter.isDownloaded) Icons.Default.Refresh else Icons.Default.Download,
+                                    contentDescription = if (chapter.isDownloaded) "從網頁重新下載本章" else "下載本章",
+                                    tint = iconTint
+                                )
                             }
                         }
                     }
