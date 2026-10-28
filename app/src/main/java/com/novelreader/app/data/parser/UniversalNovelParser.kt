@@ -68,6 +68,7 @@ class UniversalNovelParser {
 
                 val href = elem.attr("abs:href")
                 val text = elem.text().trim()
+                if (text.matches(Regex("^(上一章|下一章|上一頁|下一頁|上一页|下一页|返回目錄|返回目录|章節目錄|章节目录|回目錄|回目录)$"))) continue
                 if (href.contains("javascript:") || href.isBlank() || text.isBlank()) continue
 
                 val isChapterLink = href.contains("/cp/") || href.contains("/chapter") || href.contains("/read/") ||
@@ -88,6 +89,7 @@ class UniversalNovelParser {
                     continue
                 }
                 val text = elem.text().trim()
+                if (text.matches(Regex("^(上一章|下一章|上一頁|下一頁|上一页|下一页|返回目錄|返回目录|章節目錄|章节目录|回目錄|回目录)$"))) continue
                 val href = elem.attr("abs:href")
                 if (href.contains("javascript:") || href.isBlank() || text.isBlank()) continue
 
@@ -121,35 +123,15 @@ class UniversalNovelParser {
             }
         }
 
-        // 依章節目錄原網頁順序或章節數字排序
-        // 檢查原網頁抓取的章節是否已大致依章節號排序（例如第1章比第89章更早出現）
-        val hasNumbers = collectedChapters.count { extractChapterNumber(it.title) != null }
-        val sortedChapters = if (hasNumbers > collectedChapters.size / 2) {
-            // 如果大部分章節都有數字，但可能有些雜項
-            val firstNum = collectedChapters.firstNotNullOfOrNull { extractChapterNumber(it.title) } ?: 0L
-            val lastNum = collectedChapters.reversed().firstNotNullOfOrNull { extractChapterNumber(it.title) } ?: 0L
-
-            if (firstNum > lastNum) {
-                // 原網頁是倒序（最新章節在最上），將其翻轉為正序
-                collectedChapters.reversed()
-            } else {
-                // 原網頁本身就是正序，依照網頁結構保留正確章節次序；有數字的排前，無數字的沉底
-                collectedChapters.sortedWith(Comparator { a, b ->
-                    val numA = extractChapterNumber(a.title)
-                    val numB = extractChapterNumber(b.title)
-                    when {
-                        numA != null && numB != null -> numA.compareTo(numB)
-                        numA != null && numB == null -> -1
-                        numA == null && numB != null -> 1
-                        else -> 0
-                    }
-                })
-            }
-        } else {
-            collectedChapters
-        }.mapIndexed { idx, chapter ->
-            chapter.copy(index = idx)
-        }
+        // Keep the site's catalogue order. Sorting chapter numbers breaks
+        // multi-volume books because every volume can restart at chapter 1.
+        // Reverse only when the existing list is clearly newest-first.
+        val nums = collectedChapters.mapNotNull { extractChapterNumber(it.title) }
+        val up = nums.zipWithNext().count { (a, b) -> a < b }
+        val down = nums.zipWithNext().count { (a, b) -> a > b }
+        val newestFirst = nums.size >= 2 && down > 0 && down > up * 2
+        val sortedChapters = (if (newestFirst) collectedChapters.reversed() else collectedChapters)
+            .mapIndexed { index, chapter -> chapter.copy(index = index) }
 
         return ParsedNovelDetail(
             title = cleanTitle(title),

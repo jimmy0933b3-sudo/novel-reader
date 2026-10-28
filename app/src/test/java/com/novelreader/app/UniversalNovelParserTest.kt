@@ -100,4 +100,22 @@ class UniversalNovelParserTest {
         }
     }
 
+    @Test
+    fun keepsMultiVolumeCatalogueInWebsiteOrder() {
+        val html = """
+            <html><body><ul id="chapter-list">
+                <li><a href="/v1c1">第一卷 第一章 開始</a></li>
+                <li><a href="/v1c2">第一卷 第二章 延續</a></li>
+                <li><a href="/v2c1">第二卷 第一章 新旅程</a></li>
+                <li><a href="/v2c2">第二卷 第二章 成長</a></li>
+            </ul></body></html>
+        """.trimIndent()
+        val detail = parser.parseNovelDetail(html, "https://example.com/")
+        assertEquals(
+            listOf("第一卷 第一章 開始", "第一卷 第二章 延續",
+                "第二卷 第一章 新旅程", "第二卷 第二章 成長"),
+            detail.chapters.map { it.title }
+        )
+    }
+
 }

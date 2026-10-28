@@ -59,8 +59,10 @@ class DownloadRetryTest {
     @Test
     fun testParseChapterContentWithEmptyAndValidHtml() {
         val emptyHtml = ""
-        val emptyContent = parser.parseChapterContent(emptyHtml)
-        assertTrue(emptyContent.isBlank())
+        // A missing page is a download error, not an empty successful chapter.
+        assertThrows(IllegalStateException::class.java) {
+            parser.parseChapterContent(emptyHtml)
+        }
 
         val validHtml = "<html><body><div id='content'><p>測試章節內容</p></div></body></html>"
         val validContent = parser.parseChapterContent(validHtml)
